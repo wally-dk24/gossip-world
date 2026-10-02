@@ -159,7 +159,10 @@ gossip-deaf, and baseline: 0/20. The original pre-fix engine also
 collapses on seeds 12 and 13, so this instability is a property of the
 mechanism, not an artifact of the bug fixes (the per-cell signal dict
 fix shifts more seeds across the knife-edge, but the knife-edge is
-pre-existing). Mechanism: DANGER is emitted every tick by most
+pre-existing: a 20-seed reference run of the original pre-fix engine
+collapses on 3/20 seeds (12, 13, 18), so the knife-edge predates the
+bug fixes (the per-cell signal dict fix shifts more seeds across it,
+but did not create it). Mechanism: DANGER is emitted every tick by most
 creatures; saturation routes everyone to unselected rows; the
 population starves before selection can act.
 

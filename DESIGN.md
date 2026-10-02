@@ -127,3 +127,73 @@ This isolates the signaling contribution from the bigger-table effect.
   still being drafted by sunnyofemberhollow. Once the spec lands, run it.
 - No public posts, no Colony entry, no announcements until the 2026-10-09
   review.
+
+---
+
+# Follow-up experiments (2026-10-02)
+
+Week-1 result: the FOOD/DANGER signaling mechanism is DEAD by P4 (0/5
+seeds; signaling a net fitness cost). Failure analysis in RESULTS.md:
+
+1. Perverse information: FOOD signals marked just-depleted cells.
+2. Search-space explosion: 56 -> 208 bits, 16 -> 64-entry table.
+3. Emission cost was pure deadweight.
+
+The harness (`run.py --compare`) is reused. Experiments run in order;
+STOP at the first PASS (a pass means advancing to packaging, not piling on
+more mechanisms).
+
+## Experiment A: patch-direction signals
+
+Change of signal *semantics*; architecture identical to gossip (208-bit
+genome, 64-entry table, 6 sensors). This isolates semantics as the single
+changed variable.
+
+- The signal encodes the direction of the nearest known food from the
+  emitter's position: N/E/S/W in 2 bits (0=N, 1=E, 2=S, 3=W, matching the
+  facing convention).
+- Emission happens on *arrival* at a food cell (ACT_FORWARD steps onto a
+  cell with food > 0), *before* any depletion. The emitter scans Chebyshev
+  radius 4 (excluding its own cell) for the food cell with the most units
+  (ties: nearest, then fixed scan order) and emits the dominant-axis
+  direction toward it. If no other food is in radius, emission is
+  suppressed (nothing worth sharing; "food here" was the old perverse
+  signal).
+- Emission policy reuses bits 192-193: 00 never, 01 always on arrival,
+  10 only if energy > 100, 11 only if not crowded. Energy cost stays 1
+  (same honesty pressure as week 1).
+- DANGER is dropped for this experiment: one mechanism, clean test.
+  Bits 194-195 become spare drift (masked as neutral).
+- Receiver sensors: S4 = "direction signal heard" (any, radius 2, TTL 3,
+  unchanged channel physics), S5 = "heard direction agrees with my
+  facing". The table can discover "signal ahead -> move forward" and
+  "signal elsewhere -> turn" without decoding N/E/S/W into table entries.
+  This keeps 6 sensors / 64 entries: the architecture is byte-identical
+  to gossip, only the meaning changed.
+- Ablation: gossip-dir-deaf, same genome/table, channel fully disabled,
+  sensors hardwired false.
+
+Why this might work where week 1 failed: the old signal said "food was
+here (now partially eaten)" — unactionable. The new signal says "food is
+that way" — it maps directly onto move/turn, a much shorter causal chain
+for the table to discover. Arrival-time emission means the food is still
+there when receivers arrive (regrow is slow; receivers are within 2
+cells).
+
+### Predictions for Experiment A (written before any run)
+
+- PA1 (efficiency): gossip-dir mean energy over generations 50-150
+  exceeds gossip-dir-deaf over the same window by >= 5 points, in at
+  least 4 of 5 seeds.
+- PA2 (kill shot): if gossip-dir is not >= 3 points above gossip-dir-deaf
+  in mean energy in a majority of seeds, direction signaling is dead too.
+  If emitter fraction (bits 192-193 != never) falls below 10% by gen 150
+  in a majority of seeds, selection is purging it. Dead.
+- PA3 (sanity): the 56-bit baseline rebuild still flatlines repertoire at
+  exactly 96 by generation <= 15 (re-verified; the lab has not drifted).
+- PA4 (channel check): live direction signals > 0 in more than half of
+  generations 50-150, in a majority of seeds. If the channel is vestigial,
+  any energy result is uninterpretable.
+
+Seeds for Experiment A: 6,7,8,9,10 (fresh seeds; tests generalization,
+not seed-specific luck).

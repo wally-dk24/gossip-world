@@ -6,9 +6,10 @@ Run: python -m unittest test_world -v
 import unittest
 
 import world
-from world import (World, BASELINE, GOSSIP, GOSSIP_DEAF, Config,
+from world import (World, BASELINE, GOSSIP, GOSSIP_DEAF, GOSSIP_DIR,
+                   GOSSIP_DIR_DEAF, Config,
                    decode_action, get_bits, mutate, random_genome,
-                   ACT_EAT, SIG_FOOD, SIG_TTL)
+                   ACT_EAT, ACT_FORWARD, SIG_FOOD, SIG_TTL)
 
 
 def tiny_config(base):
@@ -18,7 +19,8 @@ def tiny_config(base):
                grid_w=12, grid_h=12, n_patches=3, patch_radius=2,
                init_pop=40, pop_cap=80, ticks_per_gen=10,
                neutral_offset=base.neutral_offset,
-               neutral_width=base.neutral_width)
+               neutral_width=base.neutral_width,
+               signal_mode=base.signal_mode)
     return c
 
 
@@ -149,6 +151,112 @@ class TestSignals(unittest.TestCase):
         s = w.sense(cr)
         self.assertFalse(s[4])
         self.assertFalse(s[5])
+
+
+class TestDirectionSignals(unittest.TestCase):
+    """Experiment A: direction-signal semantics."""
+
+    def _dir_world(self, seed=3):
+        cfg = tiny_config(GOSSIP_DIR)
+        return World(cfg, seed=seed)
+
+    def _arrival_genome(self, cr):
+        # emit policy 01 (always on arrival): bits 192-193 = 01
+        cr.genome = (cr.genome & ~(0b11 << 192)) | (0b01 << 192)
+
+    def test_arrival_emits_direction_signal(self):
+        w = self._dir_world()
+        cr = w.creatures[0]
+        self._arrival_genome(cr)
+        # put food to the EAST of the creature, none elsewhere nearby
+        ex = (cr.x + 2) % 12
+        w.food[(ex, cr.y)] = 5
+        w._rebuild_cell_pop()
+        before = cr.energy
+        d = w._nearest_food_dir(cr)
+        self.assertEqual(d, 1)  # east
+        w._maybe_emit_dir(cr)
+        self.assertIn((cr.x, cr.y), w.signals)
+        self.assertEqual(w.signals[(cr.x, cr.y)][0], 1)
+        self.assertEqual(cr.energy, before - 1)  # emission cost
+
+    def test_no_nearby_food_suppresses_emission(self):
+        w = self._dir_world()
+        cr = w.creatures[0]
+        self._arrival_genome(cr)
+        # clear all food near the creature
+        for k in list(w.food):
+            w.food[k] = 0
+        self.assertIsNone(w._nearest_food_dir(cr))
+        w._maybe_emit_dir(cr)
+        self.assertEqual(len(w.signals), 0)
+
+    def test_own_cell_food_ignored_in_scan(self):
+        # food only under the emitter's feet: nothing to point at
+        w = self._dir_world()
+        cr = w.creatures[0]
+        for k in list(w.food):
+            w.food[k] = 0
+        w.food[(cr.x, cr.y)] = 5
+        self.assertIsNone(w._nearest_food_dir(cr))
+
+    def test_eating_does_not_emit_in_dir_mode(self):
+        # classic FOOD-on-eat emission must not fire in direction mode
+        # (its payload 0 would read as a bogus "north" signal)
+        w = self._dir_world()
+        cr = w.creatures[0]
+        self._arrival_genome(cr)
+        cr.genome = (cr.genome & ~(0b111 << 3)) | (ACT_EAT << 3)
+        w.food[(cr.x, cr.y)] = 5
+        w._rebuild_cell_pop()
+        w.act(cr, (True, False, False, False, False, False))
+        self.assertEqual(len(w.signals), 0)
+
+    def test_s5_agrees_with_facing(self):
+        w = self._dir_world()
+        cr = w.creatures[0]
+        cr.facing = 0  # north
+        w.signals[(cr.x, cr.y)] = [0, 3]  # "food is north"
+        w._rebuild_cell_pop()
+        s = w.sense(cr)
+        self.assertTrue(s[4])   # heard
+        self.assertTrue(s[5])   # agrees with facing
+        cr.facing = 1  # east
+        s = w.sense(cr)
+        self.assertTrue(s[4])
+        self.assertFalse(s[5])  # north != east
+
+    def test_dir_deaf_hears_nothing(self):
+        cfg = tiny_config(GOSSIP_DIR_DEAF)
+        w = World(cfg, seed=3)
+        cr = w.creatures[0]
+        w.signals[(cr.x, cr.y)] = [2, 3]  # live signal under its nose
+        w._rebuild_cell_pop()
+        s = w.sense(cr)
+        self.assertFalse(s[4])
+        self.assertFalse(s[5])
+
+    def test_dir_neutral_bits_do_not_change_behavior(self):
+        # bits 194-195 are spare drift in dir mode: flipping them must not
+        # change the world trajectory
+        cfg = tiny_config(GOSSIP_DIR)
+        w1 = World(cfg, seed=7)
+        w2 = World(cfg, seed=7)
+        flip = 1 << 194
+        for a, b in zip(w1.creatures, w2.creatures):
+            b.genome = a.genome ^ flip
+        w1.run(3)
+        w2.run(3)
+        self.assertEqual(w1.state_hash(), w2.state_hash())
+
+    def test_dir_determinism(self):
+        cfg = tiny_config(GOSSIP_DIR)
+        w1 = World(cfg, seed=42)
+        w2 = World(cfg, seed=42)
+        w1.run(5)
+        w2.run(5)
+        self.assertEqual(w1.state_hash(), w2.state_hash())
+        self.assertEqual(w1.history, w2.history)
 
 
 class TestBaselineShape(unittest.TestCase):

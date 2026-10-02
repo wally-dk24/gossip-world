@@ -3,8 +3,12 @@
 Two configurations share this engine:
   - baseline: 56-bit genomes, 4 sensors, 16-entry policy table, no signals.
   - gossip: 208-bit genomes, 6 sensors (2 signal sensors), 64-entry table,
-    event-driven signaling with an energy cost per emission.
+    event-driven FOOD/DANGER signaling with an energy cost per emission.
   - gossip-deaf: gossip genome/table, signaling fully disabled (ablation).
+  - gossip-dir (Experiment A): gossip architecture, but the signal encodes
+    the direction (N/E/S/W) of the nearest known food, emitted on arrival
+    at a food cell before depletion. DANGER dropped.
+  - gossip-dir-deaf: gossip-dir genome/table, signaling disabled (ablation).
 
 Stdlib only. Deterministic per seed: one random.Random instance is threaded
 through everything, no wall-clock dependence, fixed tick order by creature id.
@@ -23,12 +27,14 @@ ACT_WAIT = 4
 ACT_REST = 5
 N_ACTIONS = 6
 
-# signal types
+# signal types (classic mode)
 SIG_FOOD = 0
 SIG_DANGER = 1
+# direction payload values (direction mode): 0=N 1=E 2=S 3=W (facing convention)
 SIG_TTL = 3          # ticks before a signal fades
 SIG_RADIUS = 2       # chebyshev radius within which a signal is sensed
 SIG_COST = 1         # energy per emission
+SIG_DIR_SCAN = 4     # chebyshev radius scanned for nearest food on emission
 
 # ---------------------------------------------------------------------------
 # configs
@@ -41,13 +47,16 @@ class Config:
                  imit_prob=0.2, copy_err=0.01, mut_rate=0.005,
                  eat_gain=15, move_cost=1, rest_gain=2, metabolic_cost=2,
                  repro_threshold=160, energy_max=200,
-                 neutral_offset=0, neutral_width=0):
+                 neutral_offset=0, neutral_width=0, signal_mode=None):
         self.name = name
         self.genome_bits = genome_bits
         self.table_bits = table_bits      # bits encoding the policy table
         self.n_sensors = n_sensors
         self.n_entries = 1 << n_sensors
         self.signals_enabled = signals_enabled
+        # None (no signals), "classic" (FOOD/DANGER types), or
+        # "direction" (Experiment A: 2-bit N/E/S/W food-direction payload)
+        self.signal_mode = signal_mode
         self.grid_w = grid_w
         self.grid_h = grid_h
         self.n_patches = n_patches
@@ -77,14 +86,33 @@ BASELINE = Config("baseline", genome_bits=56, table_bits=48, n_sensors=4,
 
 GOSSIP = Config("gossip", genome_bits=208, table_bits=192, n_sensors=6,
                 signals_enabled=True, neutral_offset=196, neutral_width=12,
+                signal_mode="classic",
                 grid_w=40, grid_h=40, n_patches=10, patch_radius=4,
                 food_regrow_ticks=6, metabolic_cost=3.5)
 
 GOSSIP_DEAF = Config("gossip-deaf", genome_bits=208, table_bits=192,
                      n_sensors=6, signals_enabled=False,
                      neutral_offset=196, neutral_width=12,
+                     signal_mode="classic",
                      grid_w=40, grid_h=40, n_patches=10, patch_radius=4,
                      food_regrow_ticks=6, metabolic_cost=3.5)
+
+# Experiment A: same architecture as gossip, direction-signal semantics.
+# Bits 194-195 (DANGER policy in gossip) are spare drift here, so the
+# neutral mask covers 194-207.
+GOSSIP_DIR = Config("gossip-dir", genome_bits=208, table_bits=192,
+                    n_sensors=6, signals_enabled=True,
+                    neutral_offset=194, neutral_width=14,
+                    signal_mode="direction",
+                    grid_w=40, grid_h=40, n_patches=10, patch_radius=4,
+                    food_regrow_ticks=6, metabolic_cost=3.5)
+
+GOSSIP_DIR_DEAF = Config("gossip-dir-deaf", genome_bits=208, table_bits=192,
+                         n_sensors=6, signals_enabled=False,
+                         neutral_offset=194, neutral_width=14,
+                         signal_mode="direction",
+                         grid_w=40, grid_h=40, n_patches=10, patch_radius=4,
+                         food_regrow_ticks=6, metabolic_cost=3.5)
 
 # signal-module bit offsets inside the gossip genome
 FOOD_POL_BITS = (192, 2)
@@ -215,6 +243,18 @@ class World:
                 return True
         return False
 
+    def _signal_dir_sensed(self, cr):
+        """Direction-mode: payload (0..3 = N/E/S/W) of a heard signal,
+        or None. First signal found in fixed scan order wins."""
+        c = self.cfg
+        for (ox, oy) in self._offsets(SIG_RADIUS):
+            x = (cr.x + ox) % c.grid_w
+            y = (cr.y + oy) % c.grid_h
+            s = self.signals.get((x, y))
+            if s is not None:
+                return s[0]
+        return None
+
     def sense(self, cr):
         c = self.cfg
         fx = (cr.x + DX[cr.facing]) % c.grid_w
@@ -224,9 +264,15 @@ class World:
              self._crowded_here(cr),
              cr.energy < 40]
         if c.n_sensors > 4:
-            heard = c.signals_enabled
-            s.append(heard and self._signal_sensed(cr, SIG_FOOD))
-            s.append(heard and self._signal_sensed(cr, SIG_DANGER))
+            if c.signal_mode == "direction":
+                heard = (self._signal_dir_sensed(cr)
+                         if c.signals_enabled else None)
+                s.append(heard is not None)
+                s.append(heard is not None and heard == cr.facing)
+            else:
+                heard = c.signals_enabled
+                s.append(heard and self._signal_sensed(cr, SIG_FOOD))
+                s.append(heard and self._signal_sensed(cr, SIG_DANGER))
         return tuple(s)
 
     # -- acting ------------------------------------------------------------
@@ -242,6 +288,11 @@ class World:
             cr.x = (cr.x + DX[cr.facing]) % c.grid_w
             cr.y = (cr.y + DY[cr.facing]) % c.grid_h
             cr.energy -= c.move_cost
+            # Experiment A: arrival at a food cell emits a direction signal
+            # (before any depletion), gated by the emit policy.
+            if (c.signal_mode == "direction"
+                    and self.food.get((cr.x, cr.y), 0) > 0):
+                self._maybe_emit_dir(cr)
         elif action == ACT_LEFT:
             cr.facing = (cr.facing - 1) % 4
         elif action == ACT_RIGHT:
@@ -250,7 +301,9 @@ class World:
             if self.food.get((cr.x, cr.y), 0) > 0:
                 self.food[(cr.x, cr.y)] -= 1
                 cr.energy += c.eat_gain
-                self._maybe_emit(cr, SIG_FOOD, ate=True)
+                # classic mode only: direction mode emits on arrival instead
+                if c.signal_mode == "classic":
+                    self._maybe_emit(cr, SIG_FOOD, ate=True)
         elif action == ACT_REST:
             cr.energy += c.rest_gain
         # ACT_WAIT: nothing
@@ -294,6 +347,51 @@ class World:
             del self.signals[k]
         for v in self.signals.values():
             v[1] -= 1
+
+    # -- direction signaling (Experiment A) --------------------------------
+    def _nearest_food_dir(self, cr):
+        """Direction (0=N 1=E 2=S 3=W) from the creature toward the
+        food-richest cell within SIG_DIR_SCAN, excluding its own cell.
+        Ties: nearest, then fixed scan order (deterministic).
+        None if no other food is in radius."""
+        c = self.cfg
+        best_key = None
+        best_ox = best_oy = 0
+        for (ox, oy) in self._offsets(SIG_DIR_SCAN):
+            if ox == 0 and oy == 0:
+                continue
+            x = (cr.x + ox) % c.grid_w
+            y = (cr.y + oy) % c.grid_h
+            f = self.food.get((x, y), 0)
+            if f <= 0:
+                continue
+            key = (f, -max(abs(ox), abs(oy)))
+            if best_key is None or key > best_key:
+                best_key = key
+                best_ox, best_oy = ox, oy
+        if best_key is None:
+            return None
+        if abs(best_ox) >= abs(best_oy):
+            return 1 if best_ox > 0 else 3
+        return 2 if best_oy > 0 else 0
+
+    def _maybe_emit_dir(self, cr):
+        c = self.cfg
+        if not c.signals_enabled:
+            return
+        pol = get_bits(cr.genome, *FOOD_POL_BITS)
+        if pol == 0:
+            return
+        if pol == 2 and cr.energy <= 100:
+            return
+        if pol == 3 and self._crowded_here(cr):
+            return
+        direction = self._nearest_food_dir(cr)
+        if direction is None:
+            return
+        if cr.energy > SIG_COST:
+            cr.energy -= SIG_COST
+            self.signals[(cr.x, cr.y)] = [direction, SIG_TTL]
 
     # -- ecology -----------------------------------------------------------
     def _rebuild_cell_pop(self):
@@ -372,7 +470,9 @@ class World:
             if cr.energy <= 0:
                 continue
             # danger emission checked once per tick after acting
-            if (c.signals_enabled and cr.energy > 0
+            # (classic mode only; direction mode emits on arrival)
+            if (c.signals_enabled and c.signal_mode == "classic"
+                    and cr.energy > 0
                     and get_bits(cr.genome, *DANGER_POL_BITS) != 0):
                 self._maybe_emit(cr, SIG_DANGER)
             if cr.energy >= c.repro_threshold:

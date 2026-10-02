@@ -32,7 +32,7 @@ clean-room rebuild from the spec in hermes-on-foot's post:
 - Deterministic per seed.
 - Published behavior: mean energy ~85-90, cumulative repertoire saturates at
   96 behavioral rules by generation ~10 (the ratchet flatlines; that is the
-  point). 150 generations run in about a minute. 10 tests.
+  point). 150 generations run in about a minute. 25 tests.
 
 Reconstruction choices where the spec is silent (documented so the teardown
 can attack them):
@@ -43,8 +43,8 @@ can attack them):
   (+15 energy per food unit), 4 wait, 5 rest (+2 energy).
 - Reproduction is automatic, not an action: energy >= 160 splits into two
   at 80/80, child placed on an adjacent cell.
-- Food: 40x40 grid, 12 patches of radius 4, each cell holds 0-5 units,
-  regrows +1 per 4 ticks. Eating consumes one unit.
+- Food: 40x40 grid, 10 patches of radius 4, each cell holds 0-5 units,
+  regrows +1 per 6 ticks. Eating consumes one unit.
 - One generation = 60 ticks. Population capped at 600 via culling the
   weakest when over cap (carrying capacity through competition; keeps
   turnover and selection operating at the top end).
@@ -197,3 +197,109 @@ cells).
 
 Seeds for Experiment A: 6,7,8,9,10 (fresh seeds; tests generalization,
 not seed-specific luck).
+
+---
+
+# Round 2: hardened controls (2026-10-02)
+
+An external code review of the week-1 result found the "DEAD" verdict
+rests on confounded controls. This round does not add mechanisms. It
+decomposes the week-1 energy gap (gossip 1.5-11.5 points below deaf)
+into: signal information value, emission-cost masking, and bigger-table
+cost. The original RESULTS.md verdict stands untouched; new results are
+appended alongside it.
+
+## Bugs fixed before any new run (all real, all with regression tests)
+
+1. Newborns acted on their birth tick (`_spawn` appended during the
+   `step_tick` loop, and `_cell_pop` was stale). The loop now iterates
+   over a snapshot; newborns wait one tick.
+2. One signal per cell: FOOD overwrote DANGER and vice versa. Signals
+   are now per-cell dicts `{type: ttl}`; both types coexist. Note:
+   `signals_live` now counts live signal *instances*, not cells.
+3. Docs mismatched code (12 vs 10 patches, regrow every 4 vs 6 ticks,
+   stale test count). Docs now match the code, which is what reproduces
+   the published P5 signature.
+4. P5 (and P6) printouts crashed when the history was short
+   (`f"{eb:.1f}"` with `eb is None`). Safe formatting now.
+5. `_pick_model` re-sorted the whole population per birth and let
+   newborns count as adults. A top-quartile pool is now built once per
+   tick from tick-start creatures only.
+
+## New metrics (mean energy is a weak fitness proxy)
+
+Every generation now records, alongside the old fields: `births`,
+`total_energy`, and retention-based repertoire measures. The old
+repertoire counts visited (sensor, action) combos; the new measures ask
+whether the population has *settled*:
+
+- `row_consensus`: mean over table rows of the population's action
+  agreement per row (fraction sharing the row's most common action).
+- `rows_settled`: rows with agreement >= 0.8.
+- `row_persistence`: fraction of rows whose consensus action is unchanged
+  from the previous generation (None at gen 1).
+
+## H2: the unselected-rows hypothesis (hypothesis, not fact)
+
+Hearing a signal routes a creature to table rows with little selection
+history, so its action there is near-random. Under H2 the week-1 cost
+is not "perverse information" but routing: the 64-entry table spreads
+selection thin over rows the deaf control never visits. H2 predicts
+PB4/PB5 below. It is written here as a prediction to be tested, not an
+adopted explanation.
+
+## The new arms
+
+- **gossip-noise**: 208-bit genome, 64-entry table, never emits. S4/S5
+  fire randomly at the marginal hearing rates measured in real gossip
+  runs (p_food, p_danger from the calibration pilot below; independent
+  per-sensor draws; no emission cost). gossip vs gossip-noise isolates
+  signal INFORMATION (same table, same routing, correlated vs random
+  cues). gossip-noise vs gossip-deaf measures the bigger-table cost.
+  Caveat, stated plainly: this loses the spatial clustering of real
+  signals (bursty vs uniform), so it is a slightly generous control.
+- **gossip-free**: real gossip signals with emission cost set to zero.
+- **gossip-imitable**: real gossip, but noisy imitation also copies the
+  emit-policy bits 192-195 from the model (with copy errors). Tests
+  whether the tradition mechanism can spread signaling at all. Run LAST
+  as its own arm: it changes the mechanism, not the measurement.
+
+## Predictions PB1-PB6 (written before the 20-seed comparison runs)
+
+Seeds 1-20, seed-paired across baseline, gossip-deaf, gossip,
+gossip-noise, gossip-free. Window: generations 50-150. Two-sided sign
+tests on paired differences.
+
+- PB1 (information value): if |mean E_gossip - E_noise| <= 2 points, the
+  week-1 gap comes from the bigger table, not the signal: signal
+  information content is ~0.
+- PB2 (table cost): if mean(E_noise - E_deaf) < -2, the 64-entry table
+  carries a real cost (mutation load and/or H2 routing). If
+  |mean(E_noise - E_deaf)| <= 2, the table is costless and the week-1
+  gap was the signal channel itself.
+- PB3 (cost masking): if mean(E_free - E_noise) > 2, the signal
+  information has positive value that the 1-energy emission cost
+  masked. If |mean(E_free - E_noise)| <= 2, the information is worthless
+  even when free.
+- PB4 (H2, consensus): mean row_consensus at gen 150 in gossip-deaf
+  exceeds gossip-noise by >= 0.10 (deaf's reachable set is 16 rows, so
+  agreement can concentrate; noise spreads creatures over all 64).
+- PB5 (H2, retention): mean row_persistence in gossip-deaf exceeds
+  gossip-noise by > 0.05 (noise-routed rows churn).
+- PB6 (sanity): P5 still holds on the fixed engine in >= 80% of the 20
+  seeds (repertoire flatlines at exactly 96 by gen <= 15, energy
+  75-105). If not, the lab drifted and nothing downstream means
+  anything.
+
+## Prediction PI1 (gossip-imitable, pre-registered before its runs)
+
+- PI1: if emitter_frac at gen 150 in gossip-imitable exceeds gossip by
+  > 0.15 in a majority of seeds, imitation can carry the emit policy
+  and the tradition mechanism is repaired. Energy is reported as
+  secondary; this arm tests transmission, not fitness.
+
+## Calibration pilot
+
+p_food and p_danger for gossip-noise are the mean marginal hearing
+rates over generations 50-150 of a 5-seed gossip pilot (seeds 1-5) on
+the fixed engine. Values: p_food = TBD, p_danger = TBD.

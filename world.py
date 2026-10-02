@@ -47,7 +47,8 @@ class Config:
                  imit_prob=0.2, copy_err=0.01, mut_rate=0.005,
                  eat_gain=15, move_cost=1, rest_gain=2, metabolic_cost=2,
                  repro_threshold=160, energy_max=200,
-                 neutral_offset=0, neutral_width=0, signal_mode=None):
+                 neutral_offset=0, neutral_width=0, signal_mode=None,
+                 sig_cost=1, noise_sensor_p=None, imitate_emit_bits=False):
         self.name = name
         self.genome_bits = genome_bits
         self.table_bits = table_bits      # bits encoding the policy table
@@ -77,6 +78,16 @@ class Config:
         self.energy_max = energy_max
         self.neutral_offset = neutral_offset
         self.neutral_width = neutral_width
+        # energy cost per signal emission (0 = free signals)
+        self.sig_cost = sig_cost
+        # (p_food, p_danger): when set, creatures never emit; S4/S5 fire
+        # randomly at these marginal rates instead (noise control). This
+        # loses the spatial clustering of real signals, so it is a slightly
+        # generous control: real signals are bursty, noise is uniform.
+        self.noise_sensor_p = noise_sensor_p
+        # when True, noisy imitation also copies the emit-policy bits
+        # 192-195 from the model (default: they come from the parent)
+        self.imitate_emit_bits = imitate_emit_bits
 
 
 BASELINE = Config("baseline", genome_bits=56, table_bits=48, n_sensors=4,
@@ -111,6 +122,54 @@ GOSSIP_DIR_DEAF = Config("gossip-dir-deaf", genome_bits=208, table_bits=192,
                          n_sensors=6, signals_enabled=False,
                          neutral_offset=194, neutral_width=14,
                          signal_mode="direction",
+                         grid_w=40, grid_h=40, n_patches=10, patch_radius=4,
+                         food_regrow_ticks=6, metabolic_cost=3.5)
+
+# Control battery (round 2): hardened controls for the week-1 question.
+#
+# GOSSIP_NOISE: same 208-bit genome and 64-entry table as gossip, but no
+# emissions ever happen; S4/S5 fire randomly at the marginal hearing rates
+# measured in real gossip runs (calibrated below from a pilot; independent
+# per-sensor draws). gossip vs gossip-noise isolates signal INFORMATION
+# (same table, same routing, correlated vs random cues); gossip-noise vs
+# gossip-deaf measures the bigger-table cost (mutation load and/or routing
+# to unselected rows). Loses spatial clustering of real signals: slightly
+# generous to the null.
+#
+# GOSSIP_FREE: real gossip signals with the emission cost set to zero. If
+# the information has positive value that the 1-energy cost masked,
+# gossip-free beats gossip-noise; if they tie, the information is
+# worthless even when free.
+#
+# GOSSIP_IMITABLE: real gossip, but noisy imitation also copies the
+# emit-policy bits 192-195 from the model (with copy errors). Tests whether
+# the tradition mechanism can spread signaling at all. Run LAST, as its own
+# arm: it changes the mechanism, not the measurement.
+
+# Calibrated 2026-10-02 from a 5-seed gossip pilot on the fixed engine:
+# mean fraction of creature-senses hearing FOOD / DANGER.
+NOISE_P_FOOD = 0.0    # filled by calibration run
+NOISE_P_DANGER = 0.0  # filled by calibration run
+
+GOSSIP_NOISE = Config("gossip-noise", genome_bits=208, table_bits=192,
+                      n_sensors=6, signals_enabled=False,
+                      neutral_offset=196, neutral_width=12,
+                      signal_mode="classic",
+                      noise_sensor_p=(NOISE_P_FOOD, NOISE_P_DANGER),
+                      grid_w=40, grid_h=40, n_patches=10, patch_radius=4,
+                      food_regrow_ticks=6, metabolic_cost=3.5)
+
+GOSSIP_FREE = Config("gossip-free", genome_bits=208, table_bits=192,
+                     n_sensors=6, signals_enabled=True,
+                     neutral_offset=196, neutral_width=12,
+                     signal_mode="classic", sig_cost=0,
+                     grid_w=40, grid_h=40, n_patches=10, patch_radius=4,
+                     food_regrow_ticks=6, metabolic_cost=3.5)
+
+GOSSIP_IMITABLE = Config("gossip-imitable", genome_bits=208, table_bits=192,
+                         n_sensors=6, signals_enabled=True,
+                         neutral_offset=196, neutral_width=12,
+                         signal_mode="classic", imitate_emit_bits=True,
                          grid_w=40, grid_h=40, n_patches=10, patch_radius=4,
                          food_regrow_ticks=6, metabolic_cost=3.5)
 
@@ -173,7 +232,8 @@ class World:
         self.creatures = []
         # food: dict[(x,y)] -> units
         self.food = {}
-        # signals: dict[(x,y)] -> [sigtype, ttl]
+        # signals: dict[(x,y)] -> {sigtype_or_payload: ttl}. A cell can hold
+        # several signals at once (FOOD no longer overwrites DANGER).
         self.signals = {}
         self._init_food()
         self._init_population()
@@ -181,6 +241,18 @@ class World:
         self.repertoire = set()
         # history of per-generation metrics
         self.history = []
+        # signal-hearing instrumentation (classic mode only): used to
+        # calibrate the noise control's marginal hearing rates.
+        self.hear_food = 0
+        self.hear_danger = 0
+        self.sense_count = 0
+        self._calib_snapshot = None
+        # per-row consensus from the previous generation, for the
+        # retention-based repertoire metric (row persistence)
+        self._prev_consensus = None
+        # imitation model pool (top energy quartile at tick start);
+        # rebuilt once per tick by step_tick
+        self._model_pool = None
 
     # -- setup -------------------------------------------------------------
     def _init_food(self):
@@ -238,21 +310,22 @@ class World:
         for (ox, oy) in self._offsets(SIG_RADIUS):
             x = (cr.x + ox) % c.grid_w
             y = (cr.y + oy) % c.grid_h
-            s = self.signals.get((x, y))
-            if s is not None and s[0] == sigtype:
+            d = self.signals.get((x, y))
+            if d is not None and sigtype in d:
                 return True
         return False
 
     def _signal_dir_sensed(self, cr):
         """Direction-mode: payload (0..3 = N/E/S/W) of a heard signal,
-        or None. First signal found in fixed scan order wins."""
+        or None. First signal found in fixed scan order wins; within a
+        cell the lowest payload wins (deterministic)."""
         c = self.cfg
         for (ox, oy) in self._offsets(SIG_RADIUS):
             x = (cr.x + ox) % c.grid_w
             y = (cr.y + oy) % c.grid_h
-            s = self.signals.get((x, y))
-            if s is not None:
-                return s[0]
+            d = self.signals.get((x, y))
+            if d:
+                return min(d.keys())
         return None
 
     def sense(self, cr):
@@ -264,15 +337,27 @@ class World:
              self._crowded_here(cr),
              cr.energy < 40]
         if c.n_sensors > 4:
-            if c.signal_mode == "direction":
+            if c.noise_sensor_p is not None:
+                # noise control: no emissions; S4/S5 fire randomly at the
+                # calibrated marginal hearing rates (independent draws).
+                pf, pd = c.noise_sensor_p
+                s.append(self.rng.random() < pf)
+                s.append(self.rng.random() < pd)
+            elif c.signal_mode == "direction":
                 heard = (self._signal_dir_sensed(cr)
                          if c.signals_enabled else None)
                 s.append(heard is not None)
                 s.append(heard is not None and heard == cr.facing)
             else:
                 heard = c.signals_enabled
-                s.append(heard and self._signal_sensed(cr, SIG_FOOD))
-                s.append(heard and self._signal_sensed(cr, SIG_DANGER))
+                s4 = heard and self._signal_sensed(cr, SIG_FOOD)
+                s5 = heard and self._signal_sensed(cr, SIG_DANGER)
+                if heard:
+                    self.sense_count += 1
+                    self.hear_food += bool(s4)
+                    self.hear_danger += bool(s5)
+                s.append(s4)
+                s.append(s5)
         return tuple(s)
 
     # -- acting ------------------------------------------------------------
@@ -337,16 +422,19 @@ class World:
                 return
         else:
             return
-        if cr.energy > SIG_COST:
-            cr.energy -= SIG_COST
-            self.signals[(cr.x, cr.y)] = [sigtype, SIG_TTL]
+        if cr.energy > c.sig_cost:
+            cr.energy -= c.sig_cost
+            self.signals.setdefault((cr.x, cr.y), {})[sigtype] = SIG_TTL
 
     def _decay_signals(self):
-        dead = [k for k, v in self.signals.items() if v[1] <= 1]
-        for k in dead:
-            del self.signals[k]
-        for v in self.signals.values():
-            v[1] -= 1
+        for cell in list(self.signals.keys()):
+            d = self.signals[cell]
+            for k in [k for k, ttl in d.items() if ttl <= 1]:
+                del d[k]
+            for k in d:
+                d[k] -= 1
+            if not d:
+                del self.signals[cell]
 
     # -- direction signaling (Experiment A) --------------------------------
     def _nearest_food_dir(self, cr):
@@ -389,9 +477,9 @@ class World:
         direction = self._nearest_food_dir(cr)
         if direction is None:
             return
-        if cr.energy > SIG_COST:
-            cr.energy -= SIG_COST
-            self.signals[(cr.x, cr.y)] = [direction, SIG_TTL]
+        if cr.energy > c.sig_cost:
+            cr.energy -= c.sig_cost
+            self.signals.setdefault((cr.x, cr.y), {})[direction] = SIG_TTL
 
     # -- ecology -----------------------------------------------------------
     def _rebuild_cell_pop(self):
@@ -418,16 +506,20 @@ class World:
         # transmission: noisy imitation vs genetic inheritance
         if self.rng.random() < c.imit_prob:
             model = self._pick_model()
-            table = get_bits(model.genome, 0, c.table_bits)
-            # copy errors on the table bits
+            # copied region: the policy table, plus (in imitable mode) the
+            # emit-policy bits 192-195, so the tradition mechanism can
+            # actually spread signaling behavior
+            copy_width = c.table_bits + (4 if c.imitate_emit_bits else 0)
+            src = get_bits(model.genome, 0, copy_width)
+            # copy errors on the copied bits
             copied = 0
-            for i in range(c.table_bits):
-                bit = (table >> i) & 1
+            for i in range(copy_width):
+                bit = (src >> i) & 1
                 if self.rng.random() < c.copy_err:
                     bit ^= 1
                 copied |= (bit << i)
-            # non-table bits inherited from the genetic parent
-            rest_mask = ((1 << c.genome_bits) - 1) ^ ((1 << c.table_bits) - 1)
+            # non-copied bits inherited from the genetic parent
+            rest_mask = ((1 << c.genome_bits) - 1) ^ ((1 << copy_width) - 1)
             child_genome = copied | (cr.genome & rest_mask)
             child_genome = mutate(child_genome, self.rng,
                                   c.genome_bits, c.mut_rate)
@@ -438,12 +530,20 @@ class World:
         ny = (cr.y + self.rng.choice((-1, 0, 1))) % c.grid_h
         self._spawn(nx, ny, self.rng.randrange(4), child_energy, child_genome)
 
-    def _pick_model(self):
-        # a random adult from the top energy quartile
-        alive = [cr for cr in self.creatures if cr.alive]
+    def _rebuild_model_pool(self):
+        # top energy quartile of the creatures alive at tick start. Built
+        # once per tick (not once per birth), and newborns from this tick
+        # are never eligible as models.
+        alive = [cr for cr in self.creatures if cr.alive and cr.energy > 0]
         alive.sort(key=lambda cr: cr.energy, reverse=True)
         q = max(1, len(alive) // 4)
-        return self.rng.choice(alive[:q])
+        self._model_pool = alive[:q]
+
+    def _pick_model(self):
+        # a random adult from the top energy quartile (tick-start pool)
+        if not self._model_pool:
+            self._rebuild_model_pool()
+        return self.rng.choice(self._model_pool)
 
     def _deaths(self):
         c = self.cfg
@@ -459,7 +559,10 @@ class World:
     def step_tick(self):
         c = self.cfg
         self._rebuild_cell_pop()
-        for cr in self.creatures:
+        self._rebuild_model_pool()
+        # iterate over a snapshot: newborns spawned during this tick do not
+        # act until the next tick (and are not in _cell_pop yet)
+        for cr in list(self.creatures):
             if not cr.alive or cr.energy <= 0:
                 continue
             sensors = self.sense(cr)
@@ -482,23 +585,75 @@ class World:
         self._deaths()
         self.tick += 1
 
+    def _row_consensus(self, alive):
+        """Retention-based repertoire metric.
+
+        For each policy-table row, the fraction of the alive population
+        whose table entry decodes to the row's most common action
+        (ties: lowest action index, deterministic). Returns
+        (mean_agreement, rows_settled, consensus_vector) where rows_settled
+        counts rows with agreement >= 0.8. Unlike the visited-combo
+        repertoire, this measures whether the population has SETTLED on
+        behavior, not just stumbled through sensor combos.
+        """
+        n = len(alive)
+        if n == 0:
+            return 0.0, 0, []
+        agree_sum = 0.0
+        settled = 0
+        consensus = []
+        for r in range(self.cfg.n_entries):
+            counts = [0] * N_ACTIONS
+            for cr in alive:
+                counts[decode_action(cr.genome, r)] += 1
+            best = max(counts)
+            agree = best / n
+            agree_sum += agree
+            if agree >= 0.8:
+                settled += 1
+            consensus.append(max(range(N_ACTIONS),
+                                 key=lambda a: (counts[a], -a)))
+        return agree_sum / self.cfg.n_entries, settled, consensus
+
     def step_generation(self):
+        births_before = self.next_cid
         for _ in range(self.cfg.ticks_per_gen):
             self.step_tick()
         self.generation += 1
         alive = [cr for cr in self.creatures if cr.energy > 0]
         mean_e = (sum(cr.energy for cr in alive) / len(alive)) if alive else 0
+        total_e = sum(cr.energy for cr in alive)
+        births = self.next_cid - births_before
         # emitter fraction: creatures whose FOOD emit policy is not "never"
         # (bits 192-193; zero for 56-bit baseline genomes)
         emitters = sum(1 for cr in alive
                        if get_bits(cr.genome, *FOOD_POL_BITS) != 0)
+        consensus_mean, settled, consensus = self._row_consensus(alive)
+        if self._prev_consensus is None or not consensus:
+            persistence = None
+        else:
+            same = sum(1 for a, b in zip(consensus, self._prev_consensus)
+                       if a == b)
+            persistence = same / len(consensus)
+        self._prev_consensus = consensus
+        # snapshot hearing counters at gen 50: the noise control is
+        # calibrated on the measurement window (gens 50-150), not the
+        # early transient
+        if self.generation == 50:
+            self._calib_snapshot = (self.hear_food, self.hear_danger,
+                                    self.sense_count)
         self.history.append({
             "generation": self.generation,
             "population": len(alive),
             "mean_energy": mean_e,
+            "total_energy": total_e,
+            "births": births,
             "repertoire": len(self.repertoire),
-            "signals_live": len(self.signals),
+            "signals_live": sum(len(d) for d in self.signals.values()),
             "emitter_frac": (emitters / len(alive)) if alive else 0,
+            "row_consensus": consensus_mean,
+            "rows_settled": settled,
+            "row_persistence": persistence,
         })
 
     def run(self, generations):

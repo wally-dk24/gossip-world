@@ -302,4 +302,5 @@ tests on paired differences.
 
 p_food and p_danger for gossip-noise are the mean marginal hearing
 rates over generations 50-150 of a 5-seed gossip pilot (seeds 1-5) on
-the fixed engine. Values: p_food = TBD, p_danger = TBD.
+the fixed engine. Values: p_food = 0.3685, p_danger = 0.3809
+(per-seed ranges: food 0.04-0.66, danger 0.11-0.82).

@@ -147,9 +147,11 @@ GOSSIP_DIR_DEAF = Config("gossip-dir-deaf", genome_bits=208, table_bits=192,
 # arm: it changes the mechanism, not the measurement.
 
 # Calibrated 2026-10-02 from a 5-seed gossip pilot on the fixed engine:
-# mean fraction of creature-senses hearing FOOD / DANGER.
-NOISE_P_FOOD = 0.0    # filled by calibration run
-NOISE_P_DANGER = 0.0  # filled by calibration run
+# mean fraction of creature-senses hearing FOOD / DANGER over generations
+# 50-150 (per-seed: food 0.04-0.66, danger 0.11-0.82; high seed variance
+# reflects different emitter dynamics, the mean is the honest rate).
+NOISE_P_FOOD = 0.3685
+NOISE_P_DANGER = 0.3809
 
 GOSSIP_NOISE = Config("gossip-noise", genome_bits=208, table_bits=192,
                       n_sensors=6, signals_enabled=False,

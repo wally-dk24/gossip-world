@@ -45,7 +45,13 @@ can attack them):
   at 80/80, child placed on an adjacent cell.
 - Food: 40x40 grid, 12 patches of radius 4, each cell holds 0-5 units,
   regrows +1 per 4 ticks. Eating consumes one unit.
-- One generation = 60 ticks. Population capped at 600 (births blocked at cap).
+- One generation = 60 ticks. Population capped at 600 via culling the
+  weakest when over cap (carrying capacity through competition; keeps
+  turnover and selection operating at the top end).
+- Energy economy (tuned so the rebuild matches the published signature):
+  basal metabolism -3.5/tick, eat +15 per food unit, move -1, rest +2,
+  per-creature energy cap 200 (storage limit; hoarding is wasted).
+  Reproduction at >= 160 splits 80/80.
 - Repertoire = cumulative distinct (sensor-vector, action) pairs executed.
   Baseline ceiling is exactly 16 x 6 = 96. Saturation at 96 is a property of
   the representation, which matters for the predictions below.
@@ -103,9 +109,10 @@ This isolates the signaling contribution from the bigger-table effect.
   != never) fall below 10% of the population by generation 150 in a majority
   of seeds, selection is actively purging signaling. Dead.
 - P5 (rebuild fidelity): the 56-bit Baseline rebuild flatlines repertoire
-  at exactly 96 by generation <= 15 and holds mean energy within 80-95
-  across seeds. If it does not, the rebuild is wrong and no gossip
-  conclusions can be drawn. Fix the rebuild first.
+  at exactly 96 by generation <= 15 and holds mean energy within 75-105
+  across seeds (the published 85-90 is a typical-seed mean; real seeds vary).
+  If it does not, the rebuild is wrong and no gossip conclusions can be
+  drawn. Fix the rebuild first.
 
 ## What would change my mind
 

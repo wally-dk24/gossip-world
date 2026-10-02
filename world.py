@@ -388,12 +388,17 @@ class World:
         self.generation += 1
         alive = [cr for cr in self.creatures if cr.energy > 0]
         mean_e = (sum(cr.energy for cr in alive) / len(alive)) if alive else 0
+        # emitter fraction: creatures whose FOOD emit policy is not "never"
+        # (bits 192-193; zero for 56-bit baseline genomes)
+        emitters = sum(1 for cr in alive
+                       if get_bits(cr.genome, *FOOD_POL_BITS) != 0)
         self.history.append({
             "generation": self.generation,
             "population": len(alive),
             "mean_energy": mean_e,
             "repertoire": len(self.repertoire),
             "signals_live": len(self.signals),
+            "emitter_frac": (emitters / len(alive)) if alive else 0,
         })
 
     def run(self, generations):
